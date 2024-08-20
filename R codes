@@ -1,0 +1,312 @@
+#Cattral lab mouse tumor pipeline
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+library(patchwork)
+library(plyr)
+library(dplyr)
+library(rliger)
+library(MAST)
+library(ggradar)
+library(scales)
+library(tibble)
+
+options(future.globals.maxSize = 8000 * 1024^2)
+
+ref <- MouseRNAseqData()
+
+
+Niktu <- read10X(sample.dirs = "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Cattral_Jun__Niktu_3pr_V3_1/outs/filtered_feature_bc_matrix", 
+                 sample.names = "Niktu")
+
+Wttu <- read10X(sample.dirs = "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Cattral_Jun__Wttu_3pr_V3_1/outs/filtered_feature_bc_matrix", 
+                 sample.names = "Wttu")
+
+Niktu.Seurat <- CreateSeuratObject(counts = Niktu, min.cells = 3, min.features = 200)
+Wttu.Seurat <- CreateSeuratObject(counts = Wttu, min.cells = 3, min.features = 200)
+
+
+
+Niktu.Seurat <- PercentageFeatureSet(Niktu.Seurat, pattern = "^mt-", col.name = "percent.mt")
+
+Niktu.Seurat <- subset(Niktu.Seurat, subset = nFeature_RNA < 5000 & nCount_RNA < 30000 & percent.mt < 10)
+VlnPlot(Niktu.Seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+
+Wttu.Seurat <- PercentageFeatureSet(Wttu.Seurat, pattern = "^mt-", col.name = "percent.mt")
+
+Wttu.Seurat <- subset(Wttu.Seurat, subset = nFeature_RNA < 5000 & nCount_RNA < 30000 & percent.mt < 10)
+VlnPlot(Wttu.Seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+
+mice <- merge (Niktu.Seurat, y= Wttu.Seurat)
+mice.data <- GetAssayData(mice)
+
+mice <- CreateSeuratObject(counts = mice.data, min.cells = 3, min.features = 200)
+
+mice <- PercentageFeatureSet(mice, pattern = "^mt-", col.name = "percent.mt")
+
+mice <- subset(mice, subset = nFeature_RNA < 5000 & nCount_RNA < 30000 & percent.mt < 10)
+
+VlnPlot(mice, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+Mice.list <- SplitObject(mice, split.by = "orig.ident")
+Mice.list <- Mice.list[c("Niktu", "Wttu" )]
+for (i in 1:length(Mice.list)) {
+  Mice.list[[i]] <- SCTransform(Mice.list[[i]], vars.to.regress = c("nFeature_RNA", "nCount_RNA", "percent.mt"), verbose = FALSE)
+}
+
+
+
+Mice.features <- SelectIntegrationFeatures(object.list = Mice.list, nfeatures = 3000)
+Mice.list <- PrepSCTIntegration(object.list = Mice.list, anchor.features = Mice.features, 
+                               verbose = FALSE)
+
+Mice.anchors <- FindIntegrationAnchors(object.list = Mice.list, normalization.method = "SCT", 
+                                      anchor.features = Mice.features, verbose = FALSE)
+Mice.intg <- IntegrateData(anchorset = Mice.anchors, normalization.method = "SCT", 
+                         verbose = FALSE)
+
+Mice.intg <- RunPCA(Mice.intg, verbose = FALSE)
+DimPlot(Mice.intg)
+VizDimLoadings(Mice.intg, dims = 1:4, reduction = "pca")
+Mice.intg <- RunTSNE(Mice.intg, dims = 1:30)
+DimPlot(Mice.intg) 
+
+Mice.intg <- FindNeighbors(Mice.intg, dims = 1:30, verbose = FALSE)
+Mice.intg <- FindClusters(Mice.intg, resolution = 0.6, verbose = FALSE)
+DimPlot(Mice.intg, label = TRUE, pt.size = 0.9, label.size = 5)
+
+
+
+Mice.markers <- FindAllMarkers(Mice.intg, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.75, min.diff.pct = 0.15)
+Mice.top5 <- Mice.markers %>% group_by(cluster) %>% top_n(n = 5, wt= avg_log2FC)
+DoHeatmap(Mice.intg, features = Mice.top5$gene) + NoLegend() + scale_fill_gradientn(colors = c("blue", "white", "red"))
+
+Mice.top10 <- Mice.markers %>% group_by(cluster) %>% top_n(n = 10, wt= avg_log2FC)
+write.csv(Mice.top10, "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Analysis by Sajad/top10_markers.csv")
+
+
+write.csv(Mice.markers, "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Analysis by Sajad/all_markers.csv")
+
+saveRDS(Mice.intg, file = "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Analysis by Sajad/mice_integ.rds")
+
+FeaturePlot(Mice.intg, features = c("Cd3g", "Cd4", "Cd8a", "Cd79a", "CD74"), split.by = "orig.ident")
+
+new.cluster.ids <- c("B1","Msr1+ Mac", "B2", "Inflam Mac", "NK", "CD8 T", "T", "7", "MCL", "Cd209", "Cd11a",
+                     "11", "Treg", "13", "Vcam", "15", "Cyc T", "Scd2", "Ms4a", "Cyc Mye")
+
+names(new.cluster.ids) <- levels(miceAll)
+miceAll <- RenameIdents(miceAll, new.cluster.ids)
+DimPlot(miceAll,  label = TRUE, pt.size = 0.5) + NoLegend()
+
+
+#gating on Cd3+ cells
+
+DefaultAssay(Mice.intg) <- "RNA"
+Mice.Cd3 <- subset(x = Mice.intg, subset = Cd3g > 0.1 & Itga2 < 1 & Cd79a < 1 & Cd14 < 1 & Cd68< 1 & Itgam < 1 & Fcgr3 < 1  & Ly86 < 1)
+
+
+MiceCd3.data <- GetAssayData(Mice.Cd3)
+Mice.Cd3 <- CreateSeuratObject(counts = MiceCd3.data)
+table(Mice.Cd3@meta.data[["orig.ident"]])
+Mice.Cd3 <-subset(x = Mice.Cd3, downsample = 600)
+
+Mice.Cd3 <- PercentageFeatureSet(Mice.Cd3, pattern = "^mt-", col.name = "percent.mt")
+Mice.Cd3 <- SCTransform(Mice.Cd3, vars.to.regress = "percent.mt", verbose = FALSE)
+
+Mice.Cd3 <- RunPCA(Mice.Cd3, verbose = FALSE)
+DimPlot(Mice.Cd3)
+Mice.Cd3 <- RunUMAP(Mice.Cd3, dims = 1:30, verbose = FALSE)
+DimPlot(Mice.Cd3, pt.size = 1.5)
+
+Mice.Cd3 <- RunTSNE(Mice.Cd3, dims = 1:30)
+DimPlot(Mice.Cd3, pt.size = 1.5, reduction = "tsne") 
+
+Mice.Cd3 <- FindNeighbors(Mice.Cd3, dims = 1:30, verbose = FALSE)
+Mice.Cd3 <- FindClusters(Mice.Cd3, resolution = 0.9, verbose = FALSE)
+DimPlot(Mice.Cd3, label = TRUE, pt.size = 1.5, label.size = 5)
+
+MiceCd3.markers <- FindAllMarkers(Mice.Cd3, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.75, min.diff.pct = 0.15)
+Mice.top5 <- MiceCd3.markers %>% group_by(cluster) %>% top_n(n = 5, wt= avg_log2FC)
+DoHeatmap(Mice.Cd3, features = Mice.top5$gene) + NoLegend() + scale_fill_gradientn(colors = c("blue", "white", "red"))
+
+MiceCd3.top10 <- MiceCd3.markers %>% group_by(cluster) %>% top_n(n = 10, wt= avg_log2FC)
+
+FeaturePlot(Mice.Cd3, features = feature2, ncol = 3, reduction = "tsne")
+
+Tcluster.ids <- c("T0","T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9")
+
+Tcluster.anotation <- c("T0:Gzmk+ TEM"   ,   "T1:Terminal Exh"  , "T2: Exh Cytok " ,  
+ "T3:Naïve/TCM"   ,   "T4:CD4"  ,          "T5:KLR" ,          
+ "T6:Naïve effector", "T7:Treg"     ,      "T8: Cycling") 
+
+names(Tcluster.ids) <- levels(Mice.Cd3)
+Mice.Cd3 <- RenameIdents(Mice.Cd3, Tcluster.ids)
+DimPlot(Mice.Cd3, label = TRUE, pt.size = 1.5, label.size = 5)
+
+
+
+write.csv(MiceCd3.top10, "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Analysis by Sajad/top10_Cd3Markers.csv")
+
+
+write.csv(MiceCd3.markers, "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Analysis by Sajad/all_Cd3Markers.csv")
+
+saveRDS(Mice.Cd3, file = "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Analysis by Sajad/miceCd3.rds")
+
+
+# B cells
+
+Mice.B <- subset(x = Mice.intg, idents = c("0", "2", "11"))
+
+MiceB.data <- GetAssayData(Mice.B)
+Mice.B <- CreateSeuratObject(counts = MiceB.data)
+table(Mice.B@meta.data[["orig.ident"]])
+Mice.B <-subset(x = Mice.B, downsample = 1000)
+
+Mice.B <- PercentageFeatureSet(Mice.B, pattern = "^mt-", col.name = "percent.mt")
+Mice.B <- SCTransform(Mice.B, vars.to.regress = "percent.mt", verbose = FALSE)
+
+Mice.B <- RunPCA(Mice.B, verbose = FALSE)
+DimPlot(Mice.B)
+Mice.B <- RunUMAP(Mice.B, dims = 1:30, verbose = FALSE)
+DimPlot(Mice.B, pt.size = 1.5)
+
+Mice.B <- RunTSNE(Mice.B, dims = 1:30)
+DimPlot(Mice.B, pt.size = 1.5, reduction = "tsne") 
+
+Mice.B <- FindNeighbors(Mice.B, dims = 1:30, verbose = FALSE)
+Mice.B <- FindClusters(Mice.B, resolution = 0.5, verbose = FALSE)
+DimPlot(Mice.B, label = TRUE, pt.size = 1.5, label.size = 5)
+
+MiceB.markers <- FindAllMarkers(Mice.B, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.75, min.diff.pct = 0.15)
+MiceB.top5 <- MiceB.markers %>% group_by(cluster) %>% top_n(n = 5, wt= avg_log2FC)
+DoHeatmap(Mice.B, features = MiceB.top5$gene) + NoLegend() + scale_fill_gradientn(colors = c("blue", "white", "red"))
+
+MiceB.top10 <- MiceB.markers %>% group_by(cluster) %>% top_n(n = 10, wt= avg_log2FC)
+
+FeaturePlot(Mice.B, features = feature2, ncol = 3, reduction = "tsne")
+
+
+
+write.csv(MiceCd3.top10, "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Analysis by Sajad/top10_Cd3Markers.csv")
+
+
+write.csv(MiceCd3.markers, "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Analysis by Sajad/all_Cd3Markers.csv")
+
+saveRDS(Mice.B, file = "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Analysis by Sajad/miceB_DS.rds")
+
+#Myeloid cells
+
+Mice.myeloid <- subset(x = Mice.intg, 
+                       idents = c("0", "2","4", "5", "6", "11", "12", "16"), invert = TRUE)
+
+DefaultAssay(Mice.myeloid) <- "RNA"
+Mice.myeloid <- subset(x = Mice.myeloid, subset = Cd3g < 0.1 & Cd79b < 0.1)
+MiceMye.data <- GetAssayData(Mice.myeloid)
+Mice.myeloid <- CreateSeuratObject(counts = MiceMye.data)
+table(Mice.myeloid@meta.data[["orig.ident"]])
+Mice.myeloid <-subset(x = Mice.myeloid, downsample = 2500)
+
+Mice.myeloid <- PercentageFeatureSet(Mice.myeloid, pattern = "^mt-", col.name = "percent.mt")
+Mice.myeloid <- SCTransform(Mice.myeloid, vars.to.regress = "percent.mt", verbose = FALSE)
+
+Mice.myeloid <- RunPCA(Mice.myeloid, verbose = FALSE)
+DimPlot(Mice.myeloid)
+Mice.myeloid <- RunUMAP(Mice.myeloid, dims = 1:30, verbose = FALSE)
+DimPlot(Mice.myeloid, pt.size = 1.5)
+
+Mice.myeloid <- RunTSNE(Mice.myeloid, dims = 1:30)
+DimPlot(Mice.myeloid, pt.size = 1.5, reduction = "tsne") 
+
+Mice.myeloid <- FindNeighbors(Mice.myeloid, dims = 1:30, verbose = FALSE)
+Mice.myeloid <- FindClusters(Mice.myeloid, resolution = 0.8, verbose = FALSE)
+DimPlot(Mice.myeloid, label = TRUE, pt.size = 1.5, label.size = 5)
+
+Mice.myel.markers <- FindAllMarkers(Mice.myeloid, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.75, min.diff.pct = 0.15)
+Mice.myel.top5 <- Mice.myel.markers %>% group_by(cluster) %>% top_n(n = 5, wt= avg_log2FC)
+DoHeatmap(Mice.myeloid, features = Mice.myel.top5$gene) + NoLegend() + scale_fill_gradientn(colors = c("blue", "white", "red"))
+
+Mice.myel.top10 <- MiceB.markers %>% group_by(cluster) %>% top_n(n = 10, wt= avg_log2FC)
+
+FeaturePlot(Mice.myeloid, features = feature2, ncol = 3, reduction = "tsne")
+
+Myecluster.ids <- c("M0","M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10","M11", "M12", "M13", "M14")
+
+names(Myecluster.ids) <- levels(Mice.myeloid)
+Mice.myeloid <- RenameIdents(Mice.myeloid, Myecluster.ids)
+DimPlot(Mice.myeloid, label = TRUE, pt.size = 1.5, label.size = 5)
+
+
+write.csv(MiceCd3.top10, "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Analysis by Sajad/top10_Cd3Markers.csv")
+
+
+write.csv(MiceCd3.markers, "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Analysis by Sajad/all_Cd3Markers.csv")
+
+saveRDS(Mice.myeloid, file = "D:/Sajad Moshkelgosha/220907_A00827_0645_BHTJ2HDSX3_Cattral_Jun/Analysis by Sajad/miceB_DS.rds")
+
+
+# Generate a new column called sub_cluster in the metadata
+
+Mice.intg$sub_clusters <- as.character(Idents(Mice.intg))
+
+# Change the information of cells containing sub-cluster information
+Mice.intg$sub_clusters[Cells(Mice.Cd3)] <- paste(Idents(Mice.Cd3))
+Mice.intg$sub_clusters[Cells(Mice.myeloid)] <- paste(Idents(Mice.myeloid))
+
+DimPlot(Mice.intg, group.by = "sub_clusters")
+
+Idents(object = Mice.intg) <- "sub_clusters"
+
+Mice.clean <- subset(x = Mice.intg, 
+                     idents = c("0", "1", "2","3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"), invert = TRUE)
+
+DimPlot(Mice.clean, label = TRUE, pt.size = 1.5, label.size = 5, reduction = "tsne")
+
+new_order <- c("M0","M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10","M11", "M12", "M13", "M14", "T0","T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9")
+
+Mice.clean@active.ident <- factor(Mice.clean@active.ident, levels = new_order)
+
+ontology_order <- c("Fn1 Mac","Ccl7 Mo/MoMac", "Hilpda/HSP TAM", "Cxcl9 cDC", "CxCl10 infl Mac", "Cd300 DC/Mac", "CD209 DC", "Cxcl2 infl Mac", "Cxcr2 Mac", "pDC", "preDC","M11", "M12", "M13", "M14", "Exh CD8","T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9")
+
+
+#DC
+
+Mice.DCs <- subset(x = Mice.myeloid, 
+                   idents = c("M3", "M6","M10", "M9", "M5"))
+
+DefaultAssay(Mice.DCs) <- "RNA"
+
+MiceMye.data <- GetAssayData(Mice.DCs)
+Mice.DCs <- CreateSeuratObject(counts = MiceMye.data)
+table(Mice.DCs@meta.data[["orig.ident"]])
+Mice.DCs <-subset(x = Mice.DCs, downsample = 700)
+
+Mice.DCs <- PercentageFeatureSet(Mice.DCs, pattern = "^mt-", col.name = "percent.mt")
+Mice.DCs <- SCTransform(Mice.DCs, vars.to.regress = "percent.mt", verbose = FALSE)
+
+Mice.DCs <- RunPCA(Mice.DCs, verbose = FALSE)
+DimPlot(Mice.DCs)
+Mice.DCs <- RunUMAP(Mice.DCs, dims = 1:30, verbose = FALSE)
+DimPlot(Mice.DCs, pt.size = 1.5)
+
+Mice.DCs <- RunTSNE(Mice.DCs, dims = 1:30)
+DimPlot(Mice.DCs, pt.size = 1.5, reduction = "tsne") 
+
+Mice.DCs <- FindNeighbors(Mice.DCs, dims = 1:30, verbose = FALSE)
+Mice.DCs <- FindClusters(Mice.DCs, resolution = 0.8, verbose = FALSE)
+DimPlot(Mice.DCs, label = TRUE, pt.size = 1.5, label.size = 5)
+
+Mice.DC.markers <- FindAllMarkers(Mice.DCs, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.75, min.diff.pct = 0.15)
+Mice.DC.top5 <- Mice.DC.markers %>% group_by(cluster) %>% top_n(n = 5, wt= avg_log2FC)
+DoHeatmap(Mice.DCs, features = Mice.DC.top5$gene) + NoLegend() + scale_fill_gradientn(colors = c("blue", "white", "red"))
+
+Mice.myel.top10 <- MiceB.markers %>% group_by(cluster) %>% top_n(n = 10, wt= avg_log2FC)
+
+FeaturePlot(Mice.DCs, features = feature2, ncol = 3, reduction = "tsne")
+
+DCcluster.ids <- c("D0","D1", "D2", "D3", "D4", "D5", "D6", "D7")
+
+names(DCcluster.ids) <- levels(Mice.DCs)
+Mice.DCs <- RenameIdents(Mice.DCs, DCcluster.ids)
+DimPlot(Mice.DCs, label = TRUE, pt.size = 1.5, label.size = 5)
